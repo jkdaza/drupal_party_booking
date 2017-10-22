@@ -1,0 +1,8 @@
+name = Party Booking System
+description = Creates a party booking systems.
+dependencies[] = uc_cart
+dependencies[] = uc_node_checkout
+dependencies[] = sms_sender
+package = Ubercart - extra
+core = 7.x
+

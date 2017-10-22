@@ -1,0 +1,624 @@
+<?php
+
+/**
+ * Implements hook_permission().
+ */
+function party_booking_permission() {
+	return array(
+			'administer party booking' => array(
+					'title' => t('Administer New Party Booking'),
+					'description' => t('Perform administration tasks for Party Booking.'),
+			),
+	);
+}
+
+/**
+ * Implements hook_menu().
+ */
+function party_booking_menu() {
+  $items = array();
+
+  $items['barn/party-booking-form'] = array(
+    'title' => 'Party Booking Form',
+    'description' => 'The main Party Booking Form.',
+    'page callback' => '_party_booking_form_page',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+  
+  $items['barn/party-booking-available-dates/%/%'] = array(
+  		'title' => 'Party Booking Form',
+  		'description' => 'The main Party Booking Form.',
+  		'page callback' => '_party_booking_available_dates',
+  		'page arguments' => array(2,3),
+  		'access arguments' => array('access content'),
+  		'type' => MENU_CALLBACK,
+  );
+  
+  $items['barn/party-booking-available-slots/%'] = array(
+  		'title' => 'Party Booking Form',
+  		'description' => 'The main Party Booking Form.',
+  		'page callback' => '_party_booking_available_slots',
+  		'page arguments' => array(2,3),
+  		'access arguments' => array('access content'),
+  		'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implementation of hook_theme().
+*/
+function party_booking_theme(){
+	return array(
+			'party_booking_form_page' => array(
+					'template' => 'party-booking-form-page',
+			),
+	);
+}
+
+/**
+ * Implementation of hook_form_alter
+*/
+function party_booking_form_alter(&$form, &$form_state, $form_id) {
+    if ($form_id == 'booking_node_form') {
+    	$mod_path = drupal_get_path('module', 'party_booking');
+    	drupal_add_css($mod_path . '/css/party-booking.css');
+    	$is_booking_admin = user_access('administer party booking');
+      //Booking coming from calendar;
+      if (isset($_POST['date_time']) && $_POST['date_time'] != '') {
+      	$start_date = $_POST['date_time']/1000;
+				$end_date = $start_date+7200;
+        $form["field_date_time"]["und"][0]['#default_value']["value"] = $start_date;
+        $form["field_date_time"]["und"][0]['#default_value']["value2"] = $end_date;
+        drupal_set_message('You are booking for '. date('j M Y H:i',$start_date));
+      }
+      //Grab data from POST if available
+      foreach ($_POST as $post_var=>$post_val) {
+      	
+      	if ($post_var == 'title') {
+      		$form['title']['#default_value'] = $post_val;
+      		$form['title']["#attributes"]["class"][] = 'element-invisible booking-hidden';
+      	} 
+      	else if ($post_var == 'special_requests') {
+      		$form['field_special_requests']["und"][0]["value"]['#default_value'] = $post_val;
+      	}
+      	else if ($post_var == 'extras') {
+      		$post_vals = explode(' ',$post_val);
+      		foreach ($post_vals as $pv) {
+      			if (!is_array($form['field_extras']["und"]['#default_value'])) {
+      				$form['field_extras']["und"]['#default_value'] = array();
+      			}
+      			$k = count($form['field_extras']["und"]['#default_value']);
+      			$form['field_extras']["und"]['#default_value'][$k] = trim($pv);
+      		}
+      	}
+      	else if ($post_var != 'date_time') {
+      		$fld_name = 'field_'.$post_var;
+      		
+      		if (isset($form[$fld_name])) {
+      			$fld = $form[$fld_name];
+      			if (isset($fld["und"]) && isset($fld["und"][0])) {
+      				$form[$fld_name]["und"][0]["value"]['#default_value'] = $post_val;
+      				if ($post_var != 'party_type') {
+      					$form[$fld_name]["und"][0]['#prefix'] = '<div class="booking-hidden" style="display:none;">';
+      					$form[$fld_name]["und"][0]['#suffix'] = '</div>';
+      				} else {
+      					$form[$fld_name]["und"][0]['#prefix'] = '<div style="display:none;">';
+      					$form[$fld_name]["und"][0]['#suffix'] = '</div>';
+      				}
+      			}
+      		}
+      	}
+      	
+      }
+      if (isset($_POST['new-booking-form'])) {
+      	
+      	//Hide remaining form
+      	$form["field_special_requests"]["#attributes"]["class"][] = 'element-invisible booking-hidden';
+      	drupal_add_js($mod_path . '/js/party-booking-node-form.js');
+      	
+      }
+      //Restrict the date field
+      if (user_is_anonymous() || !$is_booking_admin) {
+        $form["field_date_time"]["und"][0]['#prefix'] = '<div style="display:none;">';
+        $form["field_date_time"]["und"][0]['#suffix'] = '</div>';
+      }
+      //Hide fields used by old booking system items
+      $form["body"]['#prefix'] = '<div style="display:none;">';
+      $form["body"]['#suffix'] = '</div>';
+      $form["field_confirmed"]["#attributes"]["class"][] = 'element-invisible';
+      //Add Custom validation
+      $form['#validate'][] = '_party_booking_node_validate';
+    }
+}
+
+/**
+ * Implementation of hook_node_view
+ */
+function party_booking_node_view($node, $view_mode, $langcode) {
+	$node->content ['resend_sms'] = array(
+			'#markup' => '<b><a href="/barn/smssend/' . $node->nid . '">Resend SMS</a></b>',
+			'#weight' => 22,
+	);
+}
+
+/**
+ * Implementation of hook_cron
+ */
+function party_booking_cron() {
+	$now = strtotime("now");
+	$query = "SELECT node.title AS node_title, node.nid AS nid, node.created AS node_created FROM {node} node
+	LEFT JOIN {field_data_field_status} field_data_field_status ON node.nid = field_data_field_status.entity_id AND (field_data_field_status.entity_type = 'node' AND field_data_field_status.deleted = '0')
+	WHERE ((node.type IN  ('booking') AND (field_data_field_status.field_status_value != 'completed') AND (node.created < ".$now."-10000) ))";
+	$result = db_query($query);
+	$nids = array();
+	foreach ($result as $record) {
+		$nids[] = $record->nid;
+	}
+
+	//Send emails to customers about deletion
+	foreach ($nids as $nid) {
+		$node = node_load($nid);
+		$bemail = $node->field_email[$node->language][0]['value'];
+		//Send email to customer
+		$booking_msg = drupal_mail('ashend', 'provisional', $bemail, language_default(), array(), variable_get('site_mail', ''), FALSE);
+		$booking_msg['subject'] = variable_get('party_booking_cancelled_msg_title', '') . $node->title;
+		$booking_msg['body'] = variable_get('party_booking_cancelled_msg_body', '');
+		$system = drupal_mail_system('ashend', 'provisional');
+		$booking_msg = $system->format($booking_msg);
+		$booking_msg['result'] = $system->mail($booking_msg);
+	}
+	//Delete All Nodes
+	node_delete_multiple($nids);
+
+}
+
+/**
+ * Implementation of hook_uc_order
+ */
+function party_booking_uc_order($op, $order, $arg2) {
+	switch ($op) {
+		case 'update':
+			// Send a text when order is confirmed
+			if ($order->order_status != 'completed' && $arg2 == 'completed') {
+				foreach ($order->products as $product) {
+					
+					if (isset($product->data['node_checkout_nid'])) {
+						$node = node_load($product->data['node_checkout_nid']);
+						if ($node->type == "booking") {
+							$phone = field_get_items('node', $node, 'field_phone');
+							if(is_array($phone) && isset($phone[0]) && isset($phone[0]['safe_value'])){
+								$txt = 'Deposit received! Your party booking on '.date('D, j M Y H:i',$node->field_date_time["und"][0]["value"]).' has been confirmed.The '.variable_get('site_name', "").' Team';
+								sms_sender_send_sms($phone[0]['safe_value'],$txt);
+							}
+						}
+					}
+				}
+			}
+			break;
+	}
+}
+
+/**
+ * Implementation of hook_uc_cart_complete_sale
+ */
+function party_booking_preprocess_uc_cart_complete_sale(&$variables) {
+
+	if (isset($variables['order'])) {
+		$order = $variables['order'];
+		$christmas_prods = variable_get('party_booking_christmas_prods', '');
+		foreach ($order->products as $product) {
+			if (in_array($product->nid,$christmas_prods)) {
+				$variables['message'] = variable_get('party_booking_preprocess_msg_body', '');
+				break;
+			}
+		}
+	}
+}
+
+/**
+ * Implementation of hook_uc_checkout_pane
+ */
+function party_booking_uc_checkout_pane() {
+	// Replacement for standard billing address pane.
+	$panes[] = array(
+			'id' => 'party_booking_term_co',
+			'callback' => '_party_booking_checkout_pane_term_and_co',
+			'title' => t('Terms and Conditions'),
+			'desc' => t('Terms and Conditions for party bookings.'),
+			'weight' => 5,
+			'process' => FALSE,
+			'collapsible' => FALSE,
+	);
+	return $panes;
+}
+
+/**
+ * Callbacks
+ */
+
+function _party_booking_checkout_pane_term_and_co($op, &$arg1, $arg2) {
+	
+	
+	if ($op == 'review') {
+		$view = array();
+		if ($arg1 && isset($arg1->products)) {
+			foreach ($arg1->products as $product) {
+				if (isset($product->data['node_checkout_nid'])) {
+					$node = node_load($product->data['node_checkout_nid']);
+					if ($node->type == "booking") {
+						$view[] = 'You are booking for '.date('D, j M Y H:i',$node->field_date_time["und"][0]["value"]).'.';
+						$view[] = 'Before confirming, please make sure you have read and understood our <a href="/barn/term-conditions" target="_blank">Terms and Conditions</a>.';
+					}
+				}
+			}
+		}
+		return $view;
+	}
+	
+}
+
+function _party_booking_form_page() {
+	drupal_add_css('http://yui.yahooapis.com/pure/0.6.0/pure-min.css', array('type'=>'external'));
+	$mod_path = drupal_get_path('module', 'party_booking');
+	drupal_add_css($mod_path . '/css/party-booking.css');
+	drupal_add_library('system', 'ui.datepicker');
+	drupal_add_js($mod_path . '/js/party-booking.js');
+	$page = array(
+		'prices' => array(
+			'themed' => '14.95',
+			'after' => '7.50',
+			'weekend' => '9.95',
+			'deposit' => '50.00'
+		),
+		'module_path' => $mod_path,
+	);
+	return theme('party_booking_form_page',$page);
+}
+
+/*
+ * Return an array of available days and time, for the selected party type
+ * int $date time (in seconds)
+*/
+function _party_booking_available_slots($date) {
+	
+	$slotsByTime = array();
+	$partyTypes = array();
+	$already_booked = array();
+	//$holidayTimes = array();
+	$day_seconds = 24*60*60;
+	$daytime = intval($date);
+	
+	if ($daytime > 0) {
+		$weekday = date('N', $daytime);
+		$isWeekEnd = false;
+		if ($weekday > 5) {
+			$isWeekEnd = true;
+		}
+		$prefix = '';
+		//Holiday => 'hols_'
+		if (_pb_is_holiday($daytime)) {
+			$prefix = 'hols_';
+		}
+		if ($isWeekEnd) {
+			$partyTypes[] = $prefix . 'weekend';
+			$partyTypes[] = 'themed';
+		} else {
+			$partyTypes[] = $prefix . 'weekday';
+			$partyTypes[] = $prefix . 'after';
+		}
+		$partyTypes[] = 'exclusive';
+		
+		//Query db for existing bookings
+		$query = _pb_get_booking_query();
+		$query->condition('d.field_date_time_value2', $daytime+$day_seconds, '<=');
+		$query->condition('d.field_date_time_value', $daytime, '>=');
+		
+		
+		//$query->fields('n', array('title','nid'));
+		$query->fields('d', array('field_date_time_value'));
+		
+		$result = $query->execute();
+		
+		
+		foreach ($result as $record) {
+			$already_booked[] = $record->field_date_time_value;
+		}
+		
+		//Populate final array
+		$booked = array();
+		foreach ($partyTypes as $pt) {
+			$slot_info = _pb_get_slot_by_type($pt);
+			if (isset($slot_info['times'])) {
+				$times = $slot_info['times'];
+				foreach($times as $k=>&$slot_time) {
+					$slot_time = $daytime+$slot_time;
+					//exclude already booked
+					if (in_array($slot_time,$already_booked)) {
+						$booked[] = $times[$k];
+						unset($times[$k]);
+					}
+				}
+				$slot_info['times'] = array_values($times);
+			}
+			
+			$slotsByTime[$pt] = $slot_info;
+		}
+		$slotsByTime['booked'] = $booked;
+	}
+	
+	drupal_json_output($slotsByTime);
+}
+
+/*
+ * Return an array of available days and time, for the selected party type
+ */
+function _party_booking_available_dates($date,$type) {
+	$dates = array();
+	$already_booked = array();
+	$available = array();
+	
+	$day_seconds = 24*60*60;
+	//First Day of the Month (or Tomorrrom Midnight)
+	$firstMonthDay = new DateTime($date);
+	$firstMonthDay->modify('first day of this month');
+	$firstMonthDay = $firstMonthDay->format('U');
+	$tomorrowMidnight = mktime(0, 0, 0, date('n'), date('j') + 1);
+	if ($tomorrowMidnight > $firstMonthDay) {
+		$firstMonthDay = $tomorrowMidnight;
+	}
+	//Last Day of the Month (or Tomorrrom Midnight)
+	$lastMonthDay = new DateTime($date);
+	$lastMonthDay->modify('last day of this month');
+	$lastMonthDay = $lastMonthDay->format('U');
+	if ($tomorrowMidnight > $lastMonthDay) {
+		$lastMonthDay = $tomorrowMidnight;
+	}
+	
+	//Start populating by booking type
+	$slots = _pb_get_slot_by_type($type);
+	if ($type == 'weekend') {
+		$dates = _pb_get_month_days($firstMonthDay, $lastMonthDay, 'weekend');
+	}
+	else if ($type == 'after') {
+		$dates = _pb_get_month_days($firstMonthDay, $lastMonthDay, 'weekday');
+	}
+
+	//If dats is empty, output an empty obj and stop code execution
+	if (count($dates)<1) {
+		drupal_json_output(new stdClass);
+		return;
+	}
+	//Query db for existing bookings
+	$query = _pb_get_booking_query();
+	$query->condition('d.field_date_time_value2', $dates[count($dates)-1]+$day_seconds, '<=');
+	$query->condition('d.field_date_time_value', $dates[0], '>=');
+
+	
+	//$query->fields('n', array('title','nid'));
+	$query->fields('d', array('field_date_time_value'));
+	
+	$result = $query->execute();
+	
+		
+	foreach ($result as $record) {
+		$already_booked[] = $record->field_date_time_value;
+	}
+	
+	foreach ($dates as $date) {
+		
+		foreach ($slots as $slot_hours) {
+			$slot = $date+$slot_hours;
+			if (!in_array($slot,$already_booked)) {
+				if (isset($available[$date])) {
+					$available[$date][] = $slot;
+				} else {
+					$available[$date] = array($slot);
+				}
+			}
+		}
+	}
+	
+	
+	drupal_json_output($available);
+}
+
+function _party_booking_node_validate($form, &$form_state) {
+	
+	$telno = trim($form_state['values']['field_phone']['und'][0]['value']);
+	
+	if ($telno != 'none') {
+		preg_match("^07[456789]{1}[0-9]{8}^",$telno,$matches);
+		
+		if(count($matches) < 1 || $matches[0] != $telno){
+			$error_string = 'The mobile number is not valid.';
+			if (user_access('administer party booking')) {
+				$error_string .= ' If SMS confirmation is NOT needed, please enter <cite>none</cite>.';
+			}
+			form_set_error('field_phone', $error_string);
+		}
+	}
+}
+
+/*
+ * Utilities
+*/
+
+function _pb_is_holiday($day) {
+	$result = false;
+	$dayParam = date('d-m-Y',$day);
+	$ch = curl_init ('http://myschoolholidays.com/api/isItAHolidayOnADate?district_id=1&date='.$dayParam); 
+	curl_setopt ($ch, CURLOPT_RETURNTRANSFER, true); 
+	$output = curl_exec ($ch);
+	$isItAHoliday = json_decode($output);
+	if (isset($isItAHoliday->status) && $isItAHoliday->status == 'true') {
+		$result = true;
+	}
+	return $result;
+}
+
+function _pb_get_booking_query($completed=false) {
+	$query = db_select('node', 'n');
+	if ($completed) {
+		$query->join('field_data_field_status', 's',
+				'n.nid = s.entity_id AND s.field_status_value = :sts',
+				array(':sts' => 'completed'));
+	}
+	$query->join('field_data_field_date_time', 'd',
+			'd.entity_id = n.nid AND d.entity_type = :etype AND d.deleted = :del',
+			array(':etype' => 'node',':del' => 0));
+	$query->condition('n.type', 'booking', '=');
+	return $query;
+}
+
+function _pb_get_slot_by_type($type) {
+	$day_seconds = 24*60*60;
+	$slots = array(
+			'times' => array(), 
+			'price' => array(), 
+			'label' => 'Party', 
+			'min_child_num' => 5,
+			'max_child_num' => 30,
+			'party_info' => '',
+			'fee' => 0,
+			'farm' => false
+	);
+	//Weekend times
+	$weTimes = array(10*60*60, 11*60*60, 12.5*60*60, 13.5*60*60, 15*60*60, 16*60*60);
+	switch ($type) {
+		
+		case 'after':
+			$slots['times'][] = 16.5*60*60;
+			$slots['price'] = 7.50;
+			$slots['label'] = 'After School';
+			$slots['min_child_num'] = 10;
+			$slots['party_info'] = '1 FREE cluster of balloons!';
+			break;
+			
+		case 'hols_after':
+			$slots['times'][] = 16.5*60*60;
+			$slots['price'] = 9.95;
+			$slots['label'] = 'After School';
+			$slots['min_child_num'] = 10;
+			$slots['party_info'] = '1 FREE cluster of balloons!';
+			break;
+		
+		case 'hols_weekend':
+			$slots['times'] = $weTimes;
+			$slots['price'] = 9.95;
+			$slots['label'] = 'Weekend';
+			$slots['min_child_num'] = 10;
+			$slots['farm'] = true;
+			break;
+			
+		case 'weekend':
+			$slots['times'] = $weTimes;
+			$slots['price'] = 9.95;
+			$slots['label'] = 'Weekend';
+			$slots['min_child_num'] = 10;
+			$slots['farm'] = true;
+			break;
+
+		case 'hols_weekday':
+			$slots['times'][] = 10*60*60;
+			$slots['price'] = 9.95;
+			$slots['label'] = 'School Holiday';
+			$slots['min_child_num'] = 10;
+			$slots['party_info'] = '1 FREE cluster of balloons and unlimited squash!';
+			break;
+			
+		case 'weekday':
+				$slots['times'][] = 10*60*60;
+				$slots['times'][] = 11*60*60;
+				$slots['price'] = 6.95;
+				$slots['label'] = 'Cheeky Tots';
+				$slots['min_child_num'] = 12;
+				$slots['party_info'] = '1 FREE cluster of balloons and unlimited squash!';
+				break;
+			
+		case 'themed':
+			$slots['times'][] = 10.5*60*60;
+			$slots['times'][] = 14.5*60*60;
+			$slots['price'] = 14.95;
+			$slots['label'] = 'Themed';
+			$slots['min_child_num'] = 15;
+			$slots['party_info'] = 'Exclusive use of marquee area, 
+					Face-painter, balloon modelling, party pack, themed helium balloon, 
+					and a choice of a character.';
+			break;
+			
+		case 'exclusive':
+			$slots['times'][] = 18.5*60*60;
+			$slots['price'] = 9.95;
+			$slots['label'] = 'After Hours Exclusive';
+			$slots['min_child_num'] = 12;
+			$slots['party_info'] = 'One off &pound;50 upgrade fee.';
+			$slots['fee'] = 50;
+			break;
+	}
+	return $slots;
+}
+
+function _pb_get_month_days($firstMonthDay, $lastMonthDay, $type='weekday') {
+	$day_seconds = 24*60*60;
+	$dates = array();
+	if ($type == 'weekday') {
+		
+		//Find first not weekend (<6)
+		$firstNotWe = $firstMonthDay;
+		$weekday = date('N', $firstNotWe);
+		if ($weekday > 5) {
+			do {
+				$firstNotWe = $firstNotWe+$day_seconds;
+				$weekday = date('N', $firstNotWe);
+			} while ($weekday > 6);
+		}
+		$dates[] = $firstNotWe;
+		$date = $firstNotWe;
+		$count = 0;
+		do {
+			//Next day
+			$date = $date+$day_seconds;
+			if (date('N', $date) < 6 && $date <= $lastMonthDay) {
+				$dates[] = $date;
+			}
+			$count++;
+		} while ($date <= $lastMonthDay && $count<32);
+		
+	} else if ($type == 'weekend') {
+		
+		//Find first Saturday(6)
+		$firstSaturday = $firstMonthDay;
+		$weekday = date('N', $firstSaturday);
+		if ($weekday != 6) {
+			do {
+				$firstSaturday = $firstSaturday+$day_seconds;
+				$weekday = date('N', $firstSaturday);
+			} while ($weekday != 6);
+		}
+		$dates[] = $firstSaturday;
+		$date = $firstSaturday;
+		$count = 0;
+		do {
+			//Sunday
+			$date = $date+$day_seconds;
+			if ($date <= $lastMonthDay) {
+				$dates[] = $date;
+			}
+			//Following Saturday
+			$date = $date+($day_seconds*6);
+			if ($date <= $lastMonthDay) {
+				$dates[] = $date;
+			}
+			$count++;
+		} while ($date <= $lastMonthDay && $count<16);
+		
+		
+	} else if ($type == 'all') {
+		
+	}
+	
+	return $dates;
+}
